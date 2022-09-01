@@ -5,6 +5,7 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.hmac import HMAC
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+import timeit
 
 def hkdf(ikm, info, length=64):
     hkdf = HKDF(
@@ -25,7 +26,7 @@ def hmac(key, data):
 class ARKG_KEM(FrodoKEM):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        #self.print_intermediate_values = True
+        self.print_intermediate_values = False
         self.seedA = b' '*self.len_seedA_bytes
         self.A = self.gen(self.seedA)
 
@@ -192,7 +193,7 @@ class ARKG_KEM(FrodoKEM):
         ct = c1 + c2
         assert len(ct) == self.len_ct_bytes
         assert len(ss) == self.len_ss_bytes
-        return (ct, ss)
+        return (ct, k)
     
     
     def kem_decaps(self, sk, ct):
@@ -281,12 +282,12 @@ class ARKG_KEM(FrodoKEM):
         # Needs to avoid branching on secret data as per:
         #     Qian Guo, Thomas Johansson, Alexander Nilsson. A key-recovery timing attack on post-quantum 
         #     primitives using the Fujisaki-Okamoto transformation and its application on FrodoKEM. In CRYPTO 2020.
-        use_kprime = self.__ctverify(Bprime + C, Bprimeprime + Cprime)
-        kbar = self.__ctselect(kprime, s, use_kprime)
+        #use_kprime = self.__ctverify(Bprime + C, Bprimeprime + Cprime)
+        #kbar = self.__ctselect(kprime, s, use_kprime)
         # 17. ss = SHAKE(c1 || c2 || kbar, len_ss) (length in bits)
-        ss = self.shake(c1 + c2 + kbar, self.len_ss_bytes)
+        ss = self.shake(c1 + c2 + kprime, self.len_ss_bytes)
         assert len(ss) == self.len_ss_bytes
-        return ss
+        return kprime
 
 
     def mat_add(self, A, B):
@@ -369,7 +370,7 @@ def to_signed(input):
     return input
 
 
-def derive_pk(S,B):
+def derive_pk(S):
     c, K = arkg_kem.kem_encaps(S)
     kmac = hkdf(K, b'1')
     kcred = concat([b for b in hkdf(K, b'2', length=arkg_kem.n*arkg_kem.nbar*2)])
@@ -377,36 +378,38 @@ def derive_pk(S,B):
 
     mu = hmac(kmac, c)
     P = arkg_kem.mat_add(arkg_kem.unpack(S, arkg_kem.n, arkg_kem.nbar), arkg_kem.mat_mul(arkg_kem.A, kcred))
-    ppp = arkg_kem.mat_add(B,arkg_kem.mat_mul(arkg_kem.A,kcred))
-    cred = c, mu
-
-    return P, cred, ppp
+    
+    p = arkg_kem.seedA + arkg_kem.pack(P)
+    cred = c, mu, p
+    return p, cred
 
 
 def derive_sk(sk, sm, cred):
-    c, mu = cred
+    c, mu, pkp = cred
     K = arkg_kem.kem_decaps(sk, c)
 
     kmac = hkdf(K, b'1')
     kcred = concat([b for b in hkdf(K, b'2', length=arkg_kem.n*arkg_kem.nbar*2)])   
     kcred = arkg_kem.sample_matrix(kcred,arkg_kem.n, arkg_kem.nbar)
 
-    new_sm = to_signed(sm)
-    p = arkg_kem.mat_add(new_sm, kcred)
-    return p, kcred
+    sk = arkg_kem.unpack(sk, arkg_kem.nbar, arkg_kem.n)
+
+    p = to_signed(arkg_kem.mat_add(sm, kcred))
+    s = arkg_kem.pack(p)
+
+    Stransposed = arkg_kem._ARKG_KEM__matrix_transpose(p)
+    pkh = arkg_kem.shake(b'blah', arkg_kem.len_pkh_bytes) # match hash of pkp
+    skn = bitstring.BitArray()
+    skn.append(b' '* 24 + pkp)
+    for i in range(arkg_kem.nbar):
+        for j in range(arkg_kem.n):
+            skn.append(bitstring.BitArray(intle = Stransposed[i][j], length = 16))
+    skn.append(pkh)
+    skn = skn.bytes
+
+    return  skn
 
 
-def check(pkp,skp,P, B, kcred):
-    Pprime = to_signed(arkg_kem.mat_mul(arkg_kem.A, skp))
-    new_sm = to_signed(skp)
-    a = to_signed(arkg_kem.matrix_sub(pkp, Pprime))
-    return np.linalg.norm(a, np.inf) % arkg_kem.q < 256 and np.linalg.norm(new_sm) < 512
-
-
-arkg_kem = ARKG_KEM("FrodoKEM-976-AES")
-S, s, sm, B = arkg_kem.kem_keygen()
-P, cred, p = derive_pk(S,B)
-ppp = to_signed(p)
-skp, kcred = derive_sk(s, sm, cred)
-print(check(ppp, skp, P, B, kcred))
+def check(pkp, skp, P, B, kcred):
+    return 'NI'
 
